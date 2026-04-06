@@ -1,6 +1,6 @@
 import os
 import json
-import multiprocessing
+import multiprocessing as mp
 from pathlib import Path
 from typing import Iterator
 
@@ -86,7 +86,8 @@ def read_label_subset(raw_feature_paths: list[Path], nrows: int, label_type: str
     Read the unique labels/tags in the subset
     """
     # Distribute the vectorization work
-    pool = multiprocessing.Pool()
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=min(4, max(1, os.cpu_count() - 1)))
     argument_iterator = (
         (raw_features_string, label_type)
         for _, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths))
@@ -158,7 +159,8 @@ def vectorize_subset(X_path: Path, y_path: Path, raw_feature_paths: list[Path], 
     del X, y
 
     # Distribute the vectorization work
-    pool = multiprocessing.Pool()
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=min(4, max(1, os.cpu_count() - 1)))
     argument_iterator = (
         (irow, raw_features_string, X_path, y_path, extractor, nrows, label_type, label_map)
         for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths))
@@ -248,7 +250,8 @@ def create_vectorized_features(data_dir: Path | str, label_type: str = "label", 
 
 def read_vectorized_features(data_dir: Path | str, subset: str = "train") -> tuple[np.ndarray, np.ndarray]:
     """
-    Read vectorized features into memory mapped numpy arrays
+    Read vectorized features as memory-mapped numpy arrays
+    without loading the whole dataset into RAM.
     """
     data_path: Path = Path(data_dir)
     X_path = data_path / f"X_{subset}.dat"
@@ -261,13 +264,31 @@ def read_vectorized_features(data_dir: Path | str, subset: str = "train") -> tup
 
     extractor = PEFeatureExtractor()
     ndim: int = extractor.dim
+
+    # Đọc X bằng memmap, KHÔNG convert sang np.array
     X = np.memmap(X_path, dtype=np.float32, mode="r")
-    X = np.array(X).reshape(-1, ndim)
-    N: int = X.shape[0]
+
+    if X.size % ndim != 0:
+        raise ValueError(
+            f"Feature file size is invalid: total elements = {X.size}, "
+            f"not divisible by feature dimension = {ndim}"
+        )
+
+    N: int = X.size // ndim
+    X = X.reshape(N, ndim)
+
+    # Đọc y bằng memmap, cũng không cần np.array nếu chưa cần
     y = np.memmap(y_path, dtype=np.int32, mode="r")
-    y = np.array(y)
-    if y.shape[0] > N:
+
+    if y.size == N:
+        pass
+    elif y.size % N == 0:
         y = y.reshape(N, -1)
+    else:
+        raise ValueError(
+            f"Label file size does not match feature file: "
+            f"X has {N} samples but y has {y.size} elements"
+        )
 
     return X, y
 
@@ -285,7 +306,8 @@ def read_metadata(data_dir: Path | str) -> pl.DataFrame:
     """
     Write metadata to a csv file and return its dataframe
     """
-    pool = multiprocessing.Pool()
+    ctx = mp.get_context("spawn")
+    pool = ctx.Pool(processes=min(4, max(1, os.cpu_count() - 1)))
     data_path: Path = Path(data_dir)
 
     train_feature_paths = gather_feature_paths(data_path, "train")
