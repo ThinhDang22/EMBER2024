@@ -12,6 +12,7 @@ data/
 dataset/
 data_pe/
 vectorized/
+model/
 
 *.dat
 *.npy

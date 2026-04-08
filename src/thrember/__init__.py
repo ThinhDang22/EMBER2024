@@ -1,4 +1,5 @@
 from .features import (
+    AuthenticodeSignature,
     ByteEntropyHistogram,
     ByteHistogram,
     DataDirectories,
@@ -9,27 +10,55 @@ from .features import (
     PEFeatureExtractor,
     PEFormatWarnings,
     RichHeader,
-    AuthenticodeSignature,
     SectionInfo,
     StringExtractor,
 )
-from .model import (
+
+from .dataset import (
     read_metadata,
-    create_vectorized_features,
-    optimize_model,
-    predict_sample,
-    raw_feature_iterator,
     read_vectorized_features,
-    train_model,
-    train_ovr_model,
-    vectorize_subset,
 )
+
+from .labels import (
+    build_label_map,
+    load_label_map,
+    save_label_map,
+)
+
+from .vectorize import (
+    create_project_vectorized_features,
+    create_vectorized_features,
+)
+
+from .modeling import (
+    FitConfig,
+    UnifiedModel,
+    evaluate_classifier,
+    evaluate_multilabel_ovr,
+    load_model,
+    load_model_list,
+    predict_file,
+    predict_labels,
+    predict_scores,
+    save_model,
+    save_model_list,
+    train_classifier,
+    train_multilabel_ovr,
+    tune_classifier,
+)
+
+from .cascade import (
+    CascadeClassifier,
+    evaluate_cascade,
+)
+
 from .download import (
     download_dataset,
     download_models,
 )
 
 __all__ = [
+    "AuthenticodeSignature",
     "ByteEntropyHistogram",
     "ByteHistogram",
     "DataDirectories",
@@ -40,17 +69,31 @@ __all__ = [
     "PEFeatureExtractor",
     "PEFormatWarnings",
     "RichHeader",
-    "AuthenticodeSignature",
     "SectionInfo",
     "StringExtractor",
     "read_metadata",
-    "create_vectorized_features",
-    "optimize_model",
-    "predict_sample",
-    "raw_feature_iterator",
     "read_vectorized_features",
-    "train_model",
-    "vectorize_subset",
+    "build_label_map",
+    "load_label_map",
+    "save_label_map",
+    "create_project_vectorized_features",
+    "create_vectorized_features",
+    "FitConfig",
+    "UnifiedModel",
+    "evaluate_classifier",
+    "evaluate_multilabel_ovr",
+    "load_model",
+    "load_model_list",
+    "predict_file",
+    "predict_labels",
+    "predict_scores",
+    "save_model",
+    "save_model_list",
+    "train_classifier",
+    "train_multilabel_ovr",
+    "tune_classifier",
+    "CascadeClassifier",
+    "evaluate_cascade",
     "download_dataset",
     "download_models",
 ]
