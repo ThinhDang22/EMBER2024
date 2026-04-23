@@ -20,3 +20,6 @@ model/
 *.pkl
 *.joblib
 *.bin
+*.log
+*.json
+*.path

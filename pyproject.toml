@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "thrember"
 version = "0.1.0"
-description = "EMBER feature version 3"
+description = "EMBER2024 malware feature extraction and cascade modeling pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,7 +17,6 @@ dependencies = [
     "signify>=0.7.1",
     "huggingface_hub>=0.32.4",
     "matplotlib>=3.10.3",
-    "lightgbm>=4.6.0",
 ]
 
 [tool.setuptools]

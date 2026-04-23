@@ -11,6 +11,8 @@ check out the following resources:
 It may be useful to do feature selection to reduce this set of features to a meaningful set
 for your modeling problem.
 """
+from __future__ import annotations
+
 
 import os
 import hashlib
@@ -22,10 +24,20 @@ from pathlib import Path
 from collections import Counter, OrderedDict
 
 import numpy as np
-import pefile
+try:
+    import pefile
+except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+    pefile = None
+
 from sklearn.feature_extraction import FeatureHasher
-import signify
-from signify.authenticode.signed_file import SignedPEFile
+
+try:
+    import signify
+    from signify.authenticode.signed_file import SignedPEFile
+except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
+    signify = None
+    SignedPEFile = None
+
 from datetime import datetime
 
 
@@ -930,6 +942,9 @@ class AuthenticodeSignature(FeatureType):
             "latest_signing_time": 0,
             "signing_time_diff": 0,
         }
+        if SignedPEFile is None or signify is None:
+            return raw_obj
+
         try:
             signed_pe = SignedPEFile(io.BytesIO(bytez))
             for signed_data in signed_pe.iter_embedded_signatures():
@@ -1088,12 +1103,13 @@ class PEFeatureExtractor(object):
 
     def raw_features(self, bytez: bytes):
         pe = None
-        try:
-            pe = pefile.PE(data=bytez)
-        except pefile.PEFormatError:
-            pass
-        except AttributeError:
-            pass
+        if pefile is not None:
+            try:
+                pe = pefile.PE(data=bytez)
+            except pefile.PEFormatError:
+                pass
+            except AttributeError:
+                pass
         features = {"sha256": hashlib.sha256(bytez).hexdigest()}
         features.update({fe.name: fe.raw_features(bytez, pe) for fe in self.features})
         return features

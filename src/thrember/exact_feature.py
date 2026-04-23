@@ -1,15 +1,19 @@
-import json
-from thrember.features import PEFeatureExtractor
+"""Deprecated helper kept only for backward compatibility.
 
-pe_path = r"D:\laptrinh\python\project2\EMBER2024\src\thrember\jdk-21_windows-x64_bin.exe"
+This project no longer uses exact_feature.py in the final pipeline.
+Use prepare_data.py, train_layer1.py, train_layer2.py, benchmark_models.py,
+and eval_cascade.py instead.
+"""
 
-with open(pe_path, "rb") as f:
-    bytez = f.read()
+from __future__ import annotations
 
-extractor = PEFeatureExtractor()
-raw_feat = extractor.raw_features(bytez)
 
-with open("sample_raw_features.json", "w", encoding="utf-8") as f:
-    json.dump(raw_feat, f, indent=2, ensure_ascii=False)
+def main() -> None:
+    raise SystemExit(
+        'exact_feature.py is deprecated and not used in the final pipeline. '
+        'Please use the scripts under project/malware_pipeline/scripts instead.'
+    )
 
-print("Đã lưu raw features vào sample_raw_features.json")
+
+if __name__ == '__main__':
+    main()

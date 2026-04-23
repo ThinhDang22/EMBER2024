@@ -18,7 +18,6 @@ from .labels import (
 from .vectorize import (
     create_project_vectorized_features,
     create_vectorized_features,
-    vectorize,
     vectorize_subset,
 )
 
