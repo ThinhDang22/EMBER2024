@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,9 @@ def _status(message: str) -> None:
 
 
 def _recommended_threads() -> int:
+    env_threads = os.getenv("THREMBER_NUM_THREADS")
+    if env_threads:
+        return max(1, int(env_threads))
     return max(1, min(4, os.cpu_count() or 1))
 
 
@@ -98,7 +102,7 @@ class UnifiedModel:
             x_train,
             y_train,
             categorical_feature=self.categorical_features,
-            free_raw_data=False,
+            free_raw_data=True,
         )
 
         valid_sets = None
@@ -109,7 +113,7 @@ class UnifiedModel:
                 y_val,
                 reference=train_set,
                 categorical_feature=self.categorical_features,
-                free_raw_data=False,
+                free_raw_data=True,
             )
             valid_sets = [val_set]
             callbacks = [lgb.early_stopping(30, verbose=False)]
@@ -222,8 +226,13 @@ class UnifiedModel:
 def _filter_labeled_rows(x, y):
     if y.ndim == 1:
         keep = y != -1
+        if np.all(keep):
+            return x, y
         return x[keep], y[keep]
+
     keep = np.sum(y, axis=1) > 0
+    if np.all(keep):
+        return x, y
     return x[keep], y[keep]
 
 
@@ -303,6 +312,8 @@ def train_classifier(
         problem_type = 'binary' if num_classes <= 2 else 'multiclass'
 
     x_train, x_val, y_train, y_val = _train_val_split(x, y, validation_size, random_state)
+    del x, y
+    gc.collect()
 
     _status(f'fit model: {model_type} ({problem_type})')
     model = UnifiedModel(model_type=model_type, problem_type=problem_type, params=params)
