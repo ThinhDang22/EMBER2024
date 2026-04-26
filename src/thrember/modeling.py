@@ -22,12 +22,48 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit, train_test_split
 from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from .dataset import read_vectorized_features
 from .features import PEFeatureExtractor
 
 
 LGBM_CATEGORICAL_FEATURES = [2, 3, 4, 5, 6, 701, 702]
+
+
+def _best_binary_threshold_by_f1(y_true, scores):
+    """Select a binary classification threshold that maximizes F1 on validation data."""
+    y_true = np.asarray(y_true)
+    scores = np.asarray(scores)
+
+    if len(y_true) == 0 or len(scores) == 0:
+        return 0.5, 0.0
+
+    candidate_thresholds = np.unique(
+        np.quantile(scores, np.linspace(0.01, 0.99, 99))
+    )
+
+    best_threshold = 0.5
+    best_f1 = -1.0
+
+    for threshold in candidate_thresholds:
+        labels = (scores >= threshold).astype(np.int32)
+        f1 = f1_score(y_true, labels, zero_division=0)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = float(threshold)
+
+    return float(best_threshold), float(best_f1)
+
+
+def _tpr_at_max_fpr(fpr, tpr, max_fpr: float = 0.01):
+    """Return the best TPR while FPR is still <= max_fpr."""
+    valid = np.where(fpr <= max_fpr)[0]
+    if len(valid) == 0:
+        return 0.0
+    return float(np.max(tpr[valid]))
 
 
 def _status(message: str) -> None:
@@ -66,14 +102,25 @@ class UnifiedModel:
         self.params = params or {}
         self.categorical_features = categorical_features or LGBM_CATEGORICAL_FEATURES
         self.model = None
+        self.threshold = 0.5
+        self.validation_f1 = None
 
     def _build_sklearn_model(self):
         if self.model_type == 'logreg':
-            return LogisticRegression(**self.params)
+            return make_pipeline(
+                StandardScaler(with_mean=False),
+                LogisticRegression(**self.params),
+            )
+
         if self.model_type == 'rf':
             return RandomForestClassifier(**self.params)
+
         if self.model_type == 'mlp':
-            return MLPClassifier(**self.params)
+            return make_pipeline(
+                StandardScaler(with_mean=False),
+                MLPClassifier(**self.params),
+            )
+
         raise ValueError(f'Unsupported sklearn model_type: {self.model_type}')
 
     def fit(self, x_train, y_train, x_val=None, y_val=None) -> 'UnifiedModel':
@@ -82,6 +129,23 @@ class UnifiedModel:
         else:
             self.model = self._build_sklearn_model()
             self.model.fit(x_train, y_train)
+
+        if (
+            self.problem_type == 'binary'
+            and x_val is not None
+            and y_val is not None
+            and len(y_val) > 0
+        ):
+            try:
+                val_scores = np.asarray(self.predict_scores(x_val))
+                self.threshold, self.validation_f1 = _best_binary_threshold_by_f1(y_val, val_scores)
+                _status(
+                    f'validation threshold selected: threshold={self.threshold:.6f}, '
+                    f'f1={self.validation_f1:.6f}'
+                )
+            except Exception as exc:
+                _status(f'could not select validation threshold: {exc}')
+
         return self
 
     def _fit_lightgbm(self, x_train, y_train, x_val=None, y_val=None):
@@ -138,11 +202,13 @@ class UnifiedModel:
 
         return self.model.predict(x)
 
-    def predict_labels(self, x, threshold: float = 0.5):
+    def predict_labels(self, x, threshold: float | None = None):
         scores = self.predict_scores(x)
         arr = np.asarray(scores)
 
         if self.problem_type == 'binary':
+            if threshold is None:
+                threshold = getattr(self, 'threshold', 0.5)
             return (arr >= threshold).astype(np.int32)
         if self.problem_type == 'multiclass':
             if arr.ndim == 1:
@@ -167,6 +233,8 @@ class UnifiedModel:
                         'model_type': self.model_type,
                         'problem_type': self.problem_type,
                         'params': self.params,
+                        'threshold': self.threshold,
+                        'validation_f1': self.validation_f1,
                     },
                     fout,
                     indent=2,
@@ -180,6 +248,8 @@ class UnifiedModel:
                 'problem_type': self.problem_type,
                 'params': self.params,
                 'model': self.model,
+                'threshold': self.threshold,
+                'validation_f1': self.validation_f1,
             },
             path,
         )
@@ -208,6 +278,11 @@ class UnifiedModel:
 
             wrapper = cls(model_type=model_type, problem_type=problem_type, params=params)
             wrapper.model = booster
+
+            if meta_path.exists():
+                wrapper.threshold = float(meta.get('threshold', 0.5))
+                wrapper.validation_f1 = meta.get('validation_f1')
+
             return wrapper
 
         payload = joblib.load(path)
@@ -220,6 +295,8 @@ class UnifiedModel:
             params=payload.get('params', {}),
         )
         wrapper.model = payload['model']
+        wrapper.threshold = float(payload.get('threshold', 0.5))
+        wrapper.validation_f1 = payload.get('validation_f1')
         return wrapper
 
 
@@ -363,11 +440,11 @@ def predict_scores(model: UnifiedModel, x):
     return model.predict_scores(x)
 
 
-def predict_labels(model: UnifiedModel, x, threshold: float = 0.5):
+def predict_labels(model: UnifiedModel, x, threshold: float | None = None):
     return model.predict_labels(x, threshold=threshold)
 
 
-def predict_file(model: UnifiedModel, file_data: bytes, threshold: float = 0.5):
+def predict_file(model: UnifiedModel, file_data: bytes, threshold: float | None = None):
     extractor = PEFeatureExtractor()
     features = np.array(extractor.feature_vector(file_data), dtype=np.float32).reshape(1, -1)
     scores = model.predict_scores(features)
@@ -408,8 +485,8 @@ def evaluate_classifier(
     model: UnifiedModel,
     data_dir: Path | str,
     subset: str = 'test',
-    threshold: float = 0.5,
-) -> dict[str, float]:
+    threshold: float | None = None,
+) -> dict[str, Any]:
     _status(f'load eval data: {data_dir} [{subset}]')
     x, y = read_vectorized_features(data_dir, subset)
     x, y = _filter_labeled_rows(x, y)
@@ -423,17 +500,38 @@ def evaluate_classifier(
     scores = np.asarray(model.predict_scores(x))
 
     if model.problem_type == 'binary':
-        labels = (scores >= threshold).astype(np.int32)
+        used_threshold = threshold
+        if used_threshold is None:
+            used_threshold = getattr(model, 'threshold', 0.5)
+
+        labels = (scores >= used_threshold).astype(np.int32)
+
         roc_auc = float(roc_auc_score(y, scores))
         pr_auc = float(average_precision_score(y, scores))
+
         fpr, tpr, _ = roc_curve(y, scores)
-        idx = int(np.argmin(np.abs(fpr - 0.01)))
+        tpr_at_1pct = _tpr_at_max_fpr(fpr, tpr, max_fpr=0.01)
+
+        best_eval_threshold, best_eval_f1 = _best_binary_threshold_by_f1(y, scores)
+
         return {
             'roc_auc': roc_auc,
             'pr_auc': pr_auc,
-            'tpr_at_fpr_1pct': float(tpr[idx]),
+            'tpr_at_fpr_1pct': float(tpr_at_1pct),
+
+            'threshold': float(used_threshold),
             'accuracy': float(np.mean(labels == y)),
             'f1': float(f1_score(y, labels, zero_division=0)),
+
+            'validation_threshold': float(getattr(model, 'threshold', 0.5)),
+            'validation_f1': (
+                None
+                if getattr(model, 'validation_f1', None) is None
+                else float(model.validation_f1)
+            ),
+
+            'best_eval_threshold_by_f1': float(best_eval_threshold),
+            'best_eval_f1': float(best_eval_f1),
         }
 
     labels = model.predict_labels(x)
