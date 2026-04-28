@@ -11,7 +11,7 @@ import joblib
 import lightgbm as lgb
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, SGDClassifier, RidgeClassifier
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -112,6 +112,30 @@ class UnifiedModel:
                 LogisticRegression(**self.params),
             )
 
+        if self.model_type == 'sgd_logreg':
+            return make_pipeline(
+                StandardScaler(with_mean=False),
+                SGDClassifier(**self.params),
+            )
+
+        if self.model_type == 'sgd_huber':
+            return make_pipeline(
+                StandardScaler(with_mean=False),
+                SGDClassifier(**self.params),
+            )
+
+        if self.model_type == 'sgd_hinge':
+            return make_pipeline(
+                StandardScaler(with_mean=False),
+                SGDClassifier(**self.params),
+            )
+
+        if self.model_type == 'ridge':
+            return make_pipeline(
+                StandardScaler(with_mean=False),
+                RidgeClassifier(**self.params),
+            )
+
         if self.model_type == 'rf':
             return RandomForestClassifier(**self.params)
 
@@ -123,11 +147,29 @@ class UnifiedModel:
 
         raise ValueError(f'Unsupported sklearn model_type: {self.model_type}')
 
-    def fit(self, x_train, y_train, x_val=None, y_val=None) -> 'UnifiedModel':
+    def fit(
+        self,
+        x_train,
+        y_train,
+        x_val=None,
+        y_val=None,
+        sample_weight=None,
+        val_sample_weight=None,
+    ) -> 'UnifiedModel':
         if self.model_type == 'lgbm':
-            self.model = self._fit_lightgbm(x_train, y_train, x_val, y_val)
+            self.model = self._fit_lightgbm(
+                x_train,
+                y_train,
+                x_val,
+                y_val,
+                sample_weight=sample_weight,
+                val_sample_weight=val_sample_weight,
+            )
         else:
             self.model = self._build_sklearn_model()
+            # Most sklearn alternatives used in Layer 2 already receive class_weight
+            # in params. Passing sample_weight through a Pipeline requires step-specific
+            # kwargs and is intentionally avoided here to keep Layer 1 compatibility.
             self.model.fit(x_train, y_train)
 
         if (
@@ -148,8 +190,18 @@ class UnifiedModel:
 
         return self
 
-    def _fit_lightgbm(self, x_train, y_train, x_val=None, y_val=None):
+    def _fit_lightgbm(
+        self,
+        x_train,
+        y_train,
+        x_val=None,
+        y_val=None,
+        sample_weight=None,
+        val_sample_weight=None,
+    ):
         params = dict(self.params)
+        early_stopping_rounds = int(params.pop('early_stopping_rounds', 50))
+        log_period = int(params.pop('log_period', 50))
         params.setdefault('num_threads', _recommended_threads())
 
         if self.problem_type == 'binary':
@@ -165,24 +217,36 @@ class UnifiedModel:
         train_set = lgb.Dataset(
             x_train,
             y_train,
+            weight=sample_weight,
             categorical_feature=self.categorical_features,
             free_raw_data=True,
         )
 
         valid_sets = None
-        callbacks = None
+        valid_names = None
+        callbacks = []
         if x_val is not None and y_val is not None and len(y_val) > 0:
             val_set = lgb.Dataset(
                 x_val,
                 y_val,
+                weight=val_sample_weight,
                 reference=train_set,
                 categorical_feature=self.categorical_features,
                 free_raw_data=True,
             )
             valid_sets = [val_set]
-            callbacks = [lgb.early_stopping(30, verbose=False)]
+            valid_names = ['valid']
+            callbacks.append(lgb.early_stopping(early_stopping_rounds, verbose=False))
+            if log_period > 0:
+                callbacks.append(lgb.log_evaluation(period=log_period))
 
-        return lgb.train(params, train_set, valid_sets=valid_sets, callbacks=callbacks)
+        return lgb.train(
+            params,
+            train_set,
+            valid_sets=valid_sets,
+            valid_names=valid_names,
+            callbacks=callbacks or None,
+        )
 
     def _ensure_fitted(self) -> None:
         if self.model is None:
@@ -199,6 +263,9 @@ class UnifiedModel:
             if self.problem_type == 'binary':
                 return probs[:, 1]
             return probs
+
+        if hasattr(self.model, 'decision_function'):
+            return self.model.decision_function(x)
 
         return self.model.predict(x)
 
@@ -333,6 +400,48 @@ def _maybe_sample(x, y, sample_size: int | None, random_state: int = 42):
     return x[selected], y[selected]
 
 
+def _make_sample_weight(y, mode: str | None = None, max_weight: float = 20.0):
+    """Create per-sample class weights for imbalanced binary/multiclass data.
+
+    Supported modes:
+      - None / "none": no sample weighting
+      - "balanced": n_samples / (n_classes * class_count)
+      - "balanced_sqrt": sqrt(balanced), safer for extremely imbalanced family data
+    """
+    if mode is None or str(mode).lower() in {"", "none", "false", "0"}:
+        return None
+
+    mode = str(mode).lower()
+    y = np.asarray(y)
+    if y.ndim != 1 or len(y) == 0:
+        return None
+
+    classes, counts = np.unique(y, return_counts=True)
+    n_samples = float(len(y))
+    n_classes = float(len(classes))
+    weight_by_class = {
+        int(cls): n_samples / (n_classes * float(cnt))
+        for cls, cnt in zip(classes, counts)
+    }
+
+    sample_weight = np.asarray(
+        [weight_by_class[int(label)] for label in y],
+        dtype=np.float32,
+    )
+
+    if mode == "balanced_sqrt":
+        sample_weight = np.sqrt(sample_weight)
+    elif mode != "balanced":
+        raise ValueError(
+            f"Unsupported class_weight_mode={mode}. Use: none, balanced_sqrt, balanced"
+        )
+
+    if max_weight is not None and max_weight > 0:
+        sample_weight = np.clip(sample_weight, 1.0 / max_weight, max_weight)
+
+    return sample_weight
+
+
 def _train_val_split(x, y, validation_size: float, random_state: int):
     if validation_size <= 0 or len(y) < 2:
         return x, None, y, None
@@ -388,13 +497,47 @@ def train_classifier(
         num_classes = int(np.max(y) + 1)
         problem_type = 'binary' if num_classes <= 2 else 'multiclass'
 
+    fit_params = dict(params or {})
+    class_weight_mode = fit_params.pop('class_weight_mode', None)
+    class_weight_max = float(fit_params.pop('class_weight_max', 20.0))
+
     x_train, x_val, y_train, y_val = _train_val_split(x, y, validation_size, random_state)
+
+    sample_weight = _make_sample_weight(
+        y_train,
+        mode=class_weight_mode,
+        max_weight=class_weight_max,
+    )
+    val_sample_weight = None
+    if y_val is not None:
+        val_sample_weight = _make_sample_weight(
+            y_val,
+            mode=class_weight_mode,
+            max_weight=class_weight_max,
+        )
+
+    if sample_weight is not None:
+        _status(
+            'sample weight enabled | '
+            f'mode={class_weight_mode} | '
+            f'min={float(np.min(sample_weight)):.4f} | '
+            f'max={float(np.max(sample_weight)):.4f} | '
+            f'mean={float(np.mean(sample_weight)):.4f}'
+        )
+
     del x, y
     gc.collect()
 
     _status(f'fit model: {model_type} ({problem_type})')
-    model = UnifiedModel(model_type=model_type, problem_type=problem_type, params=params)
-    model.fit(x_train, y_train, x_val, y_val)
+    model = UnifiedModel(model_type=model_type, problem_type=problem_type, params=fit_params)
+    model.fit(
+        x_train,
+        y_train,
+        x_val,
+        y_val,
+        sample_weight=sample_weight,
+        val_sample_weight=val_sample_weight,
+    )
     _status('fit done')
     return model
 
@@ -481,6 +624,29 @@ def load_model_list(output_dir: Path | str, prefix: str = 'ovr') -> list[Unified
     return [UnifiedModel.load(output_dir / file_name) for file_name in manifest]
 
 
+def _multiclass_topk_correct(scores: np.ndarray, y_true: np.ndarray, k: int) -> int:
+    """Count top-k hits for one score chunk without storing all predictions globally."""
+    if scores.ndim != 2:
+        return 0
+    n_classes = scores.shape[1]
+    if n_classes == 0:
+        return 0
+    k = min(int(k), n_classes)
+    if k <= 1:
+        return int(np.sum(np.argmax(scores, axis=1).astype(np.int32) == y_true))
+
+    # For large class counts, do argpartition on small chunks only.
+    topk = np.argpartition(scores, n_classes - k, axis=1)[:, -k:]
+    return int(np.sum(np.any(topk == y_true.reshape(-1, 1), axis=1)))
+
+
+def _eval_chunk_size(default: int = 4096) -> int:
+    value = os.getenv('THREMBER_EVAL_CHUNK_SIZE')
+    if value:
+        return max(1, int(value))
+    return default
+
+
 def evaluate_classifier(
     model: UnifiedModel,
     data_dir: Path | str,
@@ -488,8 +654,9 @@ def evaluate_classifier(
     threshold: float | None = None,
 ) -> dict[str, Any]:
     _status(f'load eval data: {data_dir} [{subset}]')
-    x, y = read_vectorized_features(data_dir, subset)
-    x, y = _filter_labeled_rows(x, y)
+    x_raw, y_raw = read_vectorized_features(data_dir, subset)
+    total_rows = int(len(y_raw))
+    x, y = _filter_labeled_rows(x_raw, y_raw)
 
     if y.ndim != 1:
         raise ValueError('evaluate_classifier expects 1D labels.')
@@ -497,9 +664,9 @@ def evaluate_classifier(
         raise ValueError(f'No labeled rows found in subset={subset}.')
 
     _status('predict scores')
-    scores = np.asarray(model.predict_scores(x))
 
     if model.problem_type == 'binary':
+        scores = np.asarray(model.predict_scores(x))
         used_threshold = threshold
         if used_threshold is None:
             used_threshold = getattr(model, 'threshold', 0.5)
@@ -515,6 +682,10 @@ def evaluate_classifier(
         best_eval_threshold, best_eval_f1 = _best_binary_threshold_by_f1(y, scores)
 
         return {
+            'eval_rows_total_before_y_filter': total_rows,
+            'eval_rows_labeled_after_y_filter': int(len(y)),
+            'labeled_row_fraction': float(len(y) / max(total_rows, 1)),
+
             'roc_auc': roc_auc,
             'pr_auc': pr_auc,
             'tpr_at_fpr_1pct': float(tpr_at_1pct),
@@ -534,13 +705,48 @@ def evaluate_classifier(
             'best_eval_f1': float(best_eval_f1),
         }
 
-    labels = model.predict_labels(x)
-    return {
+    # Multiclass evaluation is chunked to avoid holding a huge
+    # [num_samples, num_classes] score matrix in RAM.
+    n = int(len(y))
+    labels = np.empty(n, dtype=np.int32)
+    chunk_size = _eval_chunk_size()
+    topk_values = (3, 5, 10)
+    topk_hits = {k: 0 for k in topk_values}
+
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        scores_chunk = np.asarray(model.predict_scores(x[start:end]))
+
+        if scores_chunk.ndim == 1:
+            labels[start:end] = scores_chunk.astype(np.int32)
+            continue
+
+        labels[start:end] = np.argmax(scores_chunk, axis=1).astype(np.int32)
+        y_chunk = y[start:end].astype(np.int32, copy=False)
+        for k in topk_values:
+            topk_hits[k] += _multiclass_topk_correct(scores_chunk, y_chunk, k)
+
+        if start == 0 or end == n or ((start // chunk_size) % 20 == 0):
+            _status(f'eval progress: {end}/{n}')
+
+    unique_true = int(len(np.unique(y)))
+    unique_pred = int(len(np.unique(labels)))
+
+    metrics = {
+        'eval_rows_total_before_y_filter': total_rows,
+        'eval_rows_labeled_after_y_filter': n,
+        'labeled_row_fraction': float(n / max(total_rows, 1)),
+        'num_true_classes_in_eval': unique_true,
+        'num_predicted_classes_in_eval': unique_pred,
         'accuracy': float(accuracy_score(y, labels)),
         'f1_macro': float(f1_score(y, labels, average='macro', zero_division=0)),
         'f1_weighted': float(f1_score(y, labels, average='weighted', zero_division=0)),
     }
 
+    for k, hits in topk_hits.items():
+        metrics[f'top_{k}_accuracy'] = float(hits / max(n, 1))
+
+    return metrics
 
 def evaluate_multilabel_ovr(
     models: list[UnifiedModel],
