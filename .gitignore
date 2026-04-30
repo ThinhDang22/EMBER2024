@@ -1,41 +1,27 @@
-# Python bytecode và cache
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Môi trường ảo (Virtual Environments)
-venv/
-.venv/
-env/
-bin/
-include/
-lib/
-
-# Phân phối và xây dựng (Build/Dist)
-build/
-dist/
+*.pyc
+*.pyo
 *.egg-info/
-
-# Jupyter Notebook
 .ipynb_checkpoints/
 
-# Dữ liệu và Model (Thường có dung lượng lớn)
+venv/
+.venv/
+build/
+dist/
+
 data/
 dataset/
 data_pe/
 vectorized/
 model/
 
-# Các định dạng file dữ liệu/binary cụ thể
 *.dat
 *.npy
 *.npz
 *.pkl
 *.joblib
 *.bin
-*.path
-
-# Logs và Text lưu tạm
 *.log
-*.txt
 *.json
+*.path
+*.txt
