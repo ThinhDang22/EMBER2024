@@ -23,3 +23,4 @@ model/
 *.log
 *.json
 *.path
+*.txt
