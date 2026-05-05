@@ -252,11 +252,51 @@ class UnifiedModel:
         if self.model is None:
             raise ValueError('Model is not fitted or loaded yet.')
 
+    def score_classes(self):
+        """Return the class IDs corresponding to score/probability columns, when known."""
+        self._ensure_fitted()
+
+        if self.model_type == 'lgbm':
+            if self.problem_type == 'multiclass':
+                try:
+                    return np.arange(int(self.model.num_model_per_iteration()), dtype=np.int32)
+                except Exception:
+                    return None
+            return None
+
+        if isinstance(self.model, dict) and self.model.get('kind') == 'sgd_stream':
+            classes = self.model.get('classes')
+            return None if classes is None else np.asarray(classes, dtype=np.int32)
+
+        estimator = self.model
+        if hasattr(estimator, 'steps') and estimator.steps:
+            estimator = estimator.steps[-1][1]
+        if hasattr(estimator, 'classes_'):
+            return np.asarray(estimator.classes_, dtype=np.int32)
+        return None
+
     def predict_scores(self, x):
         self._ensure_fitted()
 
         if self.model_type == 'lgbm':
             return self.model.predict(x)
+
+        # Streaming SGD models are stored as a small dict: scaler + classifier.
+        # Transform only the current chunk to avoid copying the full dataset.
+        if isinstance(self.model, dict) and self.model.get('kind') == 'sgd_stream':
+            scaler = self.model['scaler']
+            classifier = self.model['classifier']
+            x_chunk = np.array(x, dtype=np.float32, copy=True)
+            x_chunk = scaler.transform(x_chunk, copy=False)
+
+            if hasattr(classifier, 'predict_proba'):
+                probs = classifier.predict_proba(x_chunk)
+                if self.problem_type == 'binary':
+                    return probs[:, 1]
+                return probs
+            if hasattr(classifier, 'decision_function'):
+                return classifier.decision_function(x_chunk)
+            return classifier.predict(x_chunk)
 
         if hasattr(self.model, 'predict_proba'):
             probs = self.model.predict_proba(x)
@@ -280,7 +320,11 @@ class UnifiedModel:
         if self.problem_type == 'multiclass':
             if arr.ndim == 1:
                 return arr.astype(np.int32)
-            return np.argmax(arr, axis=1).astype(np.int32)
+            idx = np.argmax(arr, axis=1).astype(np.int32)
+            classes = self.score_classes()
+            if classes is not None and len(classes) == arr.shape[1]:
+                return classes[idx].astype(np.int32)
+            return idx
         if self.problem_type == 'multilabel':
             return (arr >= threshold).astype(np.int32)
 
@@ -442,6 +486,139 @@ def _make_sample_weight(y, mode: str | None = None, max_weight: float = 20.0):
     return sample_weight
 
 
+
+
+def _make_class_weight_lookup(y, mode: str | None = None, max_weight: float = 20.0):
+    """Return class->weight dict for chunked/incremental training."""
+    weights = _make_sample_weight(y, mode=mode, max_weight=max_weight)
+    if weights is None:
+        return None
+    y = np.asarray(y)
+    lookup: dict[int, float] = {}
+    for label, weight in zip(y, weights):
+        lookup[int(label)] = float(weight)
+    return lookup
+
+
+def _weights_for_labels(y_chunk, weight_lookup):
+    if weight_lookup is None:
+        return None
+    return np.asarray([weight_lookup.get(int(label), 1.0) for label in y_chunk], dtype=np.float32)
+
+
+def _iter_index_chunks(indices: np.ndarray, chunk_size: int):
+    for start in range(0, len(indices), chunk_size):
+        yield indices[start:start + chunk_size]
+
+
+def _train_streaming_sgd_classifier(
+    x_raw,
+    y_raw,
+    model_type: str,
+    params: dict[str, Any] | None,
+    problem_type: str,
+    random_state: int,
+    sample_size: int | None = None,
+) -> UnifiedModel:
+    """Train SGDClassifier incrementally on memmap-backed data.
+
+    This avoids the main RAM problem of sklearn Pipeline/Ridge/SGD full-fit:
+    train/validation split copies + StandardScaler full transform + solver buffers.
+    Only one chunk of X is materialized at a time.
+    """
+    if problem_type != 'multiclass':
+        raise ValueError('streaming SGD path is currently intended for Layer 2 multiclass training only.')
+
+    fit_params = dict(params or {})
+    epochs = int(fit_params.pop('epochs', fit_params.pop('max_iter', 4)))
+    chunk_size = int(fit_params.pop('chunk_size', os.getenv('THREMBER_TRAIN_CHUNK_SIZE', 8192)))
+    class_weight_mode = fit_params.pop('class_weight_mode', 'balanced_sqrt')
+    class_weight_max = float(fit_params.pop('class_weight_max', 20.0))
+
+    # partial_fit does not support class_weight='balanced'. Use explicit sample_weight per chunk.
+    fit_params.pop('class_weight', None)
+    fit_params.setdefault('random_state', random_state)
+    fit_params.setdefault('average', True)
+
+    keep_idx = np.flatnonzero(y_raw != -1).astype(np.int64, copy=False)
+    if len(keep_idx) == 0:
+        raise ValueError('No labeled rows found in training data.')
+
+    if sample_size is not None and sample_size < len(keep_idx):
+        y_keep = np.asarray(y_raw[keep_idx], dtype=np.int32)
+        if len(np.unique(y_keep)) > 1:
+            keep_idx, _ = train_test_split(
+                keep_idx,
+                train_size=sample_size,
+                random_state=random_state,
+                stratify=y_keep,
+            )
+        else:
+            rng = np.random.default_rng(random_state)
+            keep_idx = rng.choice(keep_idx, size=sample_size, replace=False)
+        keep_idx = np.asarray(keep_idx, dtype=np.int64)
+
+    y_train_all = np.asarray(y_raw[keep_idx], dtype=np.int32)
+    classes = np.unique(y_train_all).astype(np.int32)
+    weight_lookup = _make_class_weight_lookup(
+        y_train_all,
+        mode=class_weight_mode,
+        max_weight=class_weight_max,
+    )
+
+    _status(
+        f'streaming SGD enabled | samples={len(keep_idx)} | classes={len(classes)} | '
+        f'epochs={epochs} | chunk_size={chunk_size} | weight_mode={class_weight_mode}'
+    )
+
+    scaler = StandardScaler(with_mean=False, copy=False)
+
+    # Pass 1: fit scaler incrementally. Work on sorted indices for faster memmap reads.
+    sorted_idx = np.sort(keep_idx)
+    _status('streaming SGD scaler pass')
+    for batch_no, batch_idx in enumerate(_iter_index_chunks(sorted_idx, chunk_size), start=1):
+        x_chunk = np.array(x_raw[batch_idx], dtype=np.float32, copy=True)
+        scaler.partial_fit(x_chunk)
+        if batch_no == 1 or batch_no % 50 == 0:
+            _status(f'scaler progress: {min(batch_no * chunk_size, len(sorted_idx))}/{len(sorted_idx)}')
+        del x_chunk
+
+    classifier = SGDClassifier(**fit_params)
+    rng = np.random.default_rng(random_state)
+    first_batch = True
+
+    for epoch in range(1, max(1, epochs) + 1):
+        epoch_idx = np.array(keep_idx, copy=True)
+        rng.shuffle(epoch_idx)
+        _status(f'streaming SGD epoch {epoch}/{epochs}')
+
+        for batch_no, batch_idx in enumerate(_iter_index_chunks(epoch_idx, chunk_size), start=1):
+            y_chunk = np.asarray(y_raw[batch_idx], dtype=np.int32)
+            x_chunk = np.array(x_raw[batch_idx], dtype=np.float32, copy=True)
+            x_chunk = scaler.transform(x_chunk, copy=False)
+            sample_weight = _weights_for_labels(y_chunk, weight_lookup)
+
+            if first_batch:
+                classifier.partial_fit(x_chunk, y_chunk, classes=classes, sample_weight=sample_weight)
+                first_batch = False
+            else:
+                classifier.partial_fit(x_chunk, y_chunk, sample_weight=sample_weight)
+
+            if batch_no == 1 or batch_no % 50 == 0:
+                done = min(batch_no * chunk_size, len(epoch_idx))
+                _status(f'epoch {epoch} progress: {done}/{len(epoch_idx)}')
+
+            del x_chunk, y_chunk, sample_weight
+
+    wrapper = UnifiedModel(model_type=model_type, problem_type=problem_type, params=params)
+    wrapper.model = {
+        'kind': 'sgd_stream',
+        'scaler': scaler,
+        'classifier': classifier,
+        'classes': classes,
+    }
+    return wrapper
+
 def _train_val_split(x, y, validation_size: float, random_state: int):
     if validation_size <= 0 or len(y) < 2:
         return x, None, y, None
@@ -483,19 +660,38 @@ def train_classifier(
     """Train one binary or multiclass model."""
     _status(f'load train data: {data_dir}')
     x, y = read_vectorized_features(data_dir, 'train')
-    x, y = _filter_labeled_rows(x, y)
 
     if y.ndim != 1:
         raise ValueError('train_classifier expects 1D labels. Use train_multilabel_ovr for multilabel tasks.')
+    if len(y) == 0:
+        raise ValueError('No rows found in training data.')
+
+    if problem_type is None:
+        labeled_y = y[y != -1]
+        if len(labeled_y) == 0:
+            raise ValueError('No labeled rows found in training data.')
+        num_classes = int(np.max(labeled_y) + 1)
+        problem_type = 'binary' if num_classes <= 2 else 'multiclass'
+
+    # Full-data Layer 2 SGD models must use streaming partial_fit.
+    # The normal sklearn Pipeline path can duplicate tens/hundreds of GB.
+    if model_type.lower() in {'sgd_logreg', 'sgd_huber', 'sgd_hinge'} and problem_type == 'multiclass':
+        return _train_streaming_sgd_classifier(
+            x_raw=x,
+            y_raw=y,
+            model_type=model_type,
+            params=params,
+            problem_type=problem_type,
+            random_state=random_state,
+            sample_size=sample_size,
+        )
+
+    x, y = _filter_labeled_rows(x, y)
     if len(y) == 0:
         raise ValueError('No labeled rows found in training data.')
 
     x, y = _maybe_sample(x, y, sample_size, random_state=random_state)
     _status(f'train samples: {len(y)}')
-
-    if problem_type is None:
-        num_classes = int(np.max(y) + 1)
-        problem_type = 'binary' if num_classes <= 2 else 'multiclass'
 
     fit_params = dict(params or {})
     class_weight_mode = fit_params.pop('class_weight_mode', None)
@@ -624,7 +820,7 @@ def load_model_list(output_dir: Path | str, prefix: str = 'ovr') -> list[Unified
     return [UnifiedModel.load(output_dir / file_name) for file_name in manifest]
 
 
-def _multiclass_topk_correct(scores: np.ndarray, y_true: np.ndarray, k: int) -> int:
+def _multiclass_topk_correct(scores: np.ndarray, y_true: np.ndarray, k: int, classes=None) -> int:
     """Count top-k hits for one score chunk without storing all predictions globally."""
     if scores.ndim != 2:
         return 0
@@ -632,11 +828,17 @@ def _multiclass_topk_correct(scores: np.ndarray, y_true: np.ndarray, k: int) -> 
     if n_classes == 0:
         return 0
     k = min(int(k), n_classes)
+    classes_arr = None if classes is None else np.asarray(classes, dtype=np.int32)
+
     if k <= 1:
-        return int(np.sum(np.argmax(scores, axis=1).astype(np.int32) == y_true))
+        idx = np.argmax(scores, axis=1).astype(np.int32)
+        pred = classes_arr[idx] if classes_arr is not None and len(classes_arr) == n_classes else idx
+        return int(np.sum(pred.astype(np.int32) == y_true))
 
     # For large class counts, do argpartition on small chunks only.
     topk = np.argpartition(scores, n_classes - k, axis=1)[:, -k:]
+    if classes_arr is not None and len(classes_arr) == n_classes:
+        topk = classes_arr[topk]
     return int(np.sum(np.any(topk == y_true.reshape(-1, 1), axis=1)))
 
 
@@ -712,6 +914,7 @@ def evaluate_classifier(
     chunk_size = _eval_chunk_size()
     topk_values = (3, 5, 10)
     topk_hits = {k: 0 for k in topk_values}
+    score_classes = model.score_classes()
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
@@ -721,10 +924,14 @@ def evaluate_classifier(
             labels[start:end] = scores_chunk.astype(np.int32)
             continue
 
-        labels[start:end] = np.argmax(scores_chunk, axis=1).astype(np.int32)
+        pred_idx = np.argmax(scores_chunk, axis=1).astype(np.int32)
+        if score_classes is not None and len(score_classes) == scores_chunk.shape[1]:
+            labels[start:end] = np.asarray(score_classes, dtype=np.int32)[pred_idx]
+        else:
+            labels[start:end] = pred_idx
         y_chunk = y[start:end].astype(np.int32, copy=False)
         for k in topk_values:
-            topk_hits[k] += _multiclass_topk_correct(scores_chunk, y_chunk, k)
+            topk_hits[k] += _multiclass_topk_correct(scores_chunk, y_chunk, k, classes=score_classes)
 
         if start == 0 or end == n or ((start // chunk_size) % 20 == 0):
             _status(f'eval progress: {end}/{n}')
