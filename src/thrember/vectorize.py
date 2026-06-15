@@ -67,6 +67,18 @@ def _init_vectorize_worker(
     })
 
 
+
+def _encode_single_label(label, label_type: str, label_map: dict) -> int:
+    """Encode một label thành int. Dùng chung ở 3 nơi để tránh duplicate code."""
+    if label is None:
+        return -1
+    if isinstance(label, int):
+        return label
+    if isinstance(label, str):
+        return label_map.get(label, -1)
+    raise ValueError(f'Unable to parse label format for {label_type}: {type(label)}')
+
+
 def _vectorize_row(task: tuple[int, str]) -> int:
     irow, raw_features_string = task
     raw_features = json.loads(raw_features_string)
@@ -83,14 +95,7 @@ def _vectorize_row(task: tuple[int, str]) -> int:
 
     label = raw_features[label_type]
     if label_type in {'label', 'family'}:
-        if label is None:
-            y_mem[irow] = -1
-        elif isinstance(label, int):
-            y_mem[irow] = label
-        elif isinstance(label, str):
-            y_mem[irow] = label_map.get(label, -1)
-        else:
-            raise ValueError(f'Unable to parse label format for {label_type}: {type(label)}')
+        y_mem[irow] = _encode_single_label(label, label_type, label_map)
     else:
         if label is not None:
             if not isinstance(label, list):
@@ -127,23 +132,16 @@ def _vectorize_subset_single_worker(
     y_mem = np.memmap(y_path, dtype=np.int32, mode='r+', shape=y_shape)
 
     with _progress_bar(f'Vectorizing {subset_name} subset', nrows) as pbar:
-        for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths), start=1):
+        for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths)):
             raw_features = json.loads(raw_features_string)
-            x_mem[irow - 1] = extractor.process_raw_features(raw_features)
+            x_mem[irow] = extractor.process_raw_features(raw_features)
 
             if label_type not in raw_features:
                 raise ValueError(f'Invalid label_type: {label_type}')
             label = raw_features[label_type]
 
             if label_type in {'label', 'family'}:
-                if label is None:
-                    y_mem[irow - 1] = -1
-                elif isinstance(label, int):
-                    y_mem[irow - 1] = label
-                elif isinstance(label, str):
-                    y_mem[irow - 1] = label_map.get(label, -1)
-                else:
-                    raise ValueError(f'Unable to parse label format for {label_type}: {type(label)}')
+                y_mem[irow] = _encode_single_label(label, label_type, label_map)
             else:
                 if label is not None:
                     if not isinstance(label, list):
@@ -151,7 +149,7 @@ def _vectorize_subset_single_worker(
                     for single_label in label:
                         mapped = label_map.get(single_label)
                         if mapped is not None:
-                            y_mem[irow - 1, mapped] = 1
+                            y_mem[irow, mapped] = 1
 
             pbar.update(1)
 
@@ -292,17 +290,10 @@ def _create_label_only_subset(
         y = np.memmap(y_path, dtype=np.int32, mode='w+', shape=(nrows,))
         y[:] = -1
         with _progress_bar(f'Building labels {subset_name} subset', nrows) as pbar:
-            for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths), start=1):
+            for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths)):
                 raw_features = json.loads(raw_features_string)
                 label = raw_features.get(label_type)
-                if label is None:
-                    y[irow - 1] = -1
-                elif isinstance(label, int):
-                    y[irow - 1] = label
-                elif isinstance(label, str):
-                    y[irow - 1] = label_map.get(label, -1)
-                else:
-                    raise ValueError(f'Unable to parse label format for {label_type}: {type(label)}')
+                y[irow] = _encode_single_label(label, label_type, label_map)
                 pbar.update(1)
         y.flush()
         del y
@@ -311,7 +302,7 @@ def _create_label_only_subset(
         y = np.memmap(y_path, dtype=np.int32, mode='w+', shape=(nrows, len(label_map)))
         y[:] = 0
         with _progress_bar(f'Building labels {subset_name} subset', nrows) as pbar:
-            for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths), start=1):
+            for irow, raw_features_string in enumerate(raw_feature_iterator(raw_feature_paths)):
                 raw_features = json.loads(raw_features_string)
                 labels = raw_features.get(label_type)
                 if labels is not None:
@@ -320,7 +311,7 @@ def _create_label_only_subset(
                     for single_label in labels:
                         mapped = label_map.get(single_label)
                         if mapped is not None:
-                            y[irow - 1, mapped] = 1
+                            y[irow, mapped] = 1
                 pbar.update(1)
         y.flush()
         del y
