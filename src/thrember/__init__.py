@@ -52,6 +52,12 @@ from .cascade import (
     evaluate_cascade,
 )
 
+from .inference import (
+    DEFAULT_EXECUTABLE_EXTENSIONS,
+    MalwareScanner,
+    ScanResult,
+)
+
 from .download import (
     download_dataset,
     download_models,
@@ -94,6 +100,9 @@ __all__ = [
     "tune_classifier",
     "CascadeClassifier",
     "evaluate_cascade",
+    "DEFAULT_EXECUTABLE_EXTENSIONS",
+    "MalwareScanner",
+    "ScanResult",
     "download_dataset",
     "download_models",
 ]
